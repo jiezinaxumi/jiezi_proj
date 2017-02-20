@@ -1,0 +1,276 @@
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/shm.h>
+#include <sys/mman.h>
+#include "myalloc.h"
+#include "list.h"
+#include "myconfig.h"
+
+struct mch {
+	uint32_t psize;			//ǰһ���Ŀ���С
+	uint32_t csize:31;		//��ǰ���Ŀ���С
+	uint8_t inuse:1;		//1-ʹ����, 0-����
+	list_head_t list;		
+};
+
+#define INIT_BLOCK_SIZE 256
+
+static list_head_t stublist;	//�����ڴ�������ͷ
+static list_head_t *freelist;	//�����ڴ�������ͷ���飬ÿ���ڴ��鰴�մ�С��һ��Ϊminblksz�����������ҽ�����Ӧ�Ŀ�������
+								//freelist[0]�ҽӴ���maxcachesize���ڴ���
+								
+static const uint32_t minblksz = 1<<6;	//��С�Ŀ���С
+static uint32_t blklstsz;				//����С��������
+static uint32_t maxcachesize;			//�ɷ�������������С
+static uint64_t freesize = 0;			//ʣ����ʹ���ڴ���С
+
+static uint32_t hugemem_total = 0;		//hugemem_page�ܸ���
+static uint32_t hugemem_free = 0;		//hugemem_page���и���
+static uint32_t hugemem_pagesize = 0;	//hugemem_page��Ԫ��С(kB)
+
+static void detect_hugemem() {
+	
+	FILE* file = popen("cat /proc/meminfo", "r");
+	if(file) {
+		char buf[4096] = {0};
+		fread(buf, sizeof(buf) - 1, 1, file);
+		char* p = strstr(buf, "HugePages_Total:");
+		if(p) {
+			p += 16;
+			char* q = strstr(p, "\n");
+			*q = '\0';
+			hugemem_total = atoi(p);
+			p = q + 1;
+			p = strstr(p, "HugePages_Free:");
+			p += 15;
+			q = strstr(p, "\n");
+			*q = '\0';
+			hugemem_free = atoi(p);
+			p = q + 1;
+			p = strstr(p, "Hugepagesize:");
+			p += 13;
+			q = strstr(p, "kB");
+			*q = '\0';
+			hugemem_pagesize = atoi(p);
+		}
+		fclose(file);
+	}
+}
+static void config_hugemem(unsigned memsize) {
+
+	if(!hugemem_pagesize)
+		return;
+		
+	unsigned pagecount;	
+	if((pagecount = (memsize * 1024 % hugemem_pagesize)) == 0)
+		pagecount = memsize * 1024 / hugemem_pagesize;
+	else
+		pagecount = (memsize * 1024 + hugemem_pagesize - pagecount) / hugemem_pagesize;	
+
+	if(hugemem_free < pagecount) {
+		hugemem_total = hugemem_total + pagecount - hugemem_free;
+		char buf[128];
+		sprintf(buf, "echo %d > /proc/sys/vm/nr_hugepages", hugemem_total);	
+		system(buf);
+		FILE* file = popen("cat /proc/sys/vm/nr_hugepages", "r");
+		if(file) {
+			memset(buf, 0x0, sizeof(buf));
+			fread(buf, sizeof(buf) - 1, 1, file);
+			if(atoi(buf) != hugemem_total) {
+				hugemem_pagesize = 0;	
+			}
+			fclose(file);
+		}
+	}
+}
+static void* alloc_mem(unsigned size) {
+
+	void *ptr = NULL;
+	unsigned real_size;
+
+	if(hugemem_pagesize) {
+
+		if((real_size = (size % (1024 * hugemem_pagesize))) != 0)
+			real_size = size + (1024 * hugemem_pagesize - real_size);
+		else
+			real_size = size;
+
+		int id = shmget(IPC_PRIVATE, real_size, IPC_CREAT|SHM_HUGETLB|SHM_R|SHM_W);
+		if(id >= 0) {
+			ptr = shmat(id, NULL, 0); 
+			if((int)ptr == -1)
+				ptr = NULL;
+			shmctl(id, IPC_RMID, NULL);
+		} 
+	}
+
+	if(ptr == NULL) {	
+		
+		int pagesize = getpagesize();
+		if((real_size = size % pagesize) != 0)
+			real_size = size + pagesize - real_size;
+		else
+			real_size = size;
+
+		ptr = mmap( NULL, real_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); 
+
+		if((int)ptr == -1)
+			ptr = NULL;
+	}
+	return ptr;
+}
+static void free_mem(void* mem, unsigned size) {
+	munmap(mem, size);
+}
+/*static void* native_alloc(uint32_t size) {
+	return malloc(size);
+}
+static void native_free(void* ptr) {
+	free(ptr);
+}*/
+int myalloc_init(uint32_t totalsize, uint32_t maxsize) {
+
+	if(maxsize & (maxsize - 1))
+		return -1;
+
+	if(!myconfig_get_intval("disable_hugemem", 1)) {
+		detect_hugemem();	
+		config_hugemem(totalsize);
+	}
+
+	maxcachesize = maxsize + minblksz;
+	blklstsz = maxcachesize / minblksz;
+		
+	//minblksz = maxcachesize / (blklstsz >> 1); 
+	printf("totalsize=%d, maxcachesize=%d, minblksz=%d, blklstsz=%d\n", totalsize, maxcachesize, minblksz, blklstsz);
+	
+	INIT_LIST_HEAD(&stublist);
+	freelist = malloc(sizeof(struct list_head) * blklstsz);
+	if(freelist == NULL) 
+		return -1;
+
+	int i;
+	for(i = 0; i < blklstsz; i++)
+		INIT_LIST_HEAD(freelist + i);
+
+	int n;
+	struct mch *ent;
+	for(n = totalsize, i = INIT_BLOCK_SIZE; n; n -= i) {
+		if(i > n) 
+			i = n;
+//		ent = native_alloc(i << 20);
+		ent = alloc_mem(i << 20);
+		if(ent == NULL) 
+			break;
+		ent->inuse = 1;
+		ent->psize = 0;
+		ent->csize = i<<20;
+		list_add(&ent->list, &stublist);
+		ent = (struct mch *)((char *)ent + minblksz);
+		ent->inuse = 0;
+		ent->psize = minblksz;
+		ent->csize = (i<<20) - 2 * minblksz;
+		freesize += ent->csize;
+		list_add(&ent->list, freelist);
+		ent = (struct mch *)((char *)ent + (i<<20) - 2 * minblksz);
+		ent->inuse = 1;
+		ent->psize = (i<<20) - 2 * minblksz;
+		ent->csize = 0;
+	}
+	
+	return n ? -1 : 0;
+}
+void myalloc_fini() {
+	
+	if(stublist.next) {
+		while(!list_empty(&stublist)) {
+			struct mch *ent = list_entry(stublist.next, struct mch, list);
+			list_del(&ent->list);
+//			native_free(ent);
+			free_mem(ent, ent->csize);
+		}
+	}
+	free(freelist);
+}
+void* myalloc_alloc(uint32_t size) {
+	
+	size = (size + minblksz + minblksz - 1) & ~(minblksz - 1);
+	
+	if(size > maxcachesize)
+		return NULL;
+	
+	int n;  
+	for(n = size / minblksz; n < blklstsz; n++) 
+		if(!list_empty(freelist + n)) 
+			break;
+			
+	if(n >= blklstsz) {
+		if(list_empty(freelist))
+			return NULL;
+		n = 0;
+	}       
+
+	struct mch *ent;
+	ent = list_entry(freelist[n].next, struct mch, list);
+	list_del_init(&ent->list);
+	ent->inuse = 1;
+	freesize -= size;
+	if(ent->csize == size) 
+		return (char*)ent + minblksz;
+	
+	struct mch *ent1 = (struct mch *)((char *)ent + size);
+	struct mch *ent2 = (struct mch *)((char *)ent + ent->csize);
+	
+	ent1->csize = ent->csize - size;
+	ent1->psize = size;
+	ent->csize = size;
+	ent2->psize = ent1->csize;
+	n = ent1->csize / minblksz;
+	if(n >= blklstsz) 
+		n = 0;
+	ent1->inuse = 0;
+	list_add(&ent1->list, freelist + n);
+	return (char*)ent + minblksz;
+}
+void myalloc_free(void* ptr) {
+	
+	struct mch *ent = (struct mch*)((char*)ptr - minblksz); 
+	if(ent->csize & (minblksz - 1) || ent->csize == 0) {
+		return;
+	}
+	
+	freesize += ent->csize;
+	struct mch *ent1 = (struct mch *)((char *)ent - ent->psize);
+	struct mch *ent2 = (struct mch *)((char *)ent + ent->csize);
+	if(ent1->inuse == 0) {
+		list_del(&ent1->list);
+		ent1->csize += ent->csize;
+		ent = ent1;
+		if(ent2->inuse == 0) {
+			list_del(&ent2->list);
+			ent->csize += ent2->csize;
+			ent2 = (struct mch *)((char *)ent + ent->csize);
+		}
+		ent2->psize = ent->csize;
+	} 
+	else {
+		ent->inuse = 0;
+		if(ent2->inuse == 0) {
+			list_del(&ent2->list);
+			ent->csize += ent2->csize;
+			ent2 = (struct mch *)((char *)ent + ent->csize);
+			ent2->psize = ent->csize;
+		}
+	} 
+	int n = ent->csize / minblksz;
+	if(n >= blklstsz) 
+		n = 0;
+	ent->inuse = 0;
+	list_add(&ent->list, freelist + n);
+}
+void myalloc_stat(uint64_t* size) {
+	*size = freesize;
+}
