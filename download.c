@@ -136,6 +136,7 @@ static int handle_request(struct conn* c, const char* reqdata, int reqlen) {
 	return R_COMP;
 }
 
+
 int svc_ginit(struct context* ct) {
 
 	/* 注册一个自己的日志对象mylog，后面两个参数名要跟DECLARE_LOG的参数一样 */	
@@ -161,7 +162,7 @@ int svc_ginit(struct context* ct) {
 	
 	initmimetype();
 		
-	LOG(mylog, LOG_DEBUG, "download ginit\n");
+	LOG(mylog, LOG_DEBUG, "download ginit succ\n");
 	return R_SUCC;
 }
 int svc_linit(struct context* ct) {
